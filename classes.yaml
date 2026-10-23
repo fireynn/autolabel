@@ -1,0 +1,81 @@
+# Классы для autolabel.py. Порядок задаёт ID класса в Darknet (0, 1, 2...).
+#
+# Поля класса (обязательно только name):
+#   name       — имя в obj.names
+#   prompt     — фраза (или список фраз) для детектора, по-английски, коротко и по делу
+#   desc       — описание (или список) для CLIP: цвет, форма, отличительные детали
+#   refs       — папка с образцами (по умолчанию refs/<name>/): 5–20 вырезок объекта
+#   thr        — свой порог уверенности для класса (по умолчанию --accept)
+#   max_aspect — макс. вытянутость рамки (длинная/короткая сторона), например 1.6 для знаков
+#   refine     — color: подогнать рамку к цветной табличке знака (отрезать стойку и фон)
+#
+# Короткие формы тоже работают:
+#   classes: [cat, dog, person]
+#   classes: {cat: "a cat", dog: "a dog"}
+
+# Что детектор ищет «в общем» (помогает найти всё, потом классификатор разберёт):
+generic:
+  - traffic sign
+  - traffic light
+
+# Если классификатор выбирает одно из этого — рамка выбрасывается.
+# Ещё сильнее: положите вырезки ложных срабатываний в refs/_reject/
+reject:
+  - a photo of some other traffic sign
+  - a photo of a car
+  - a photo of a street lamp
+  - a photo of a billboard or advertisement
+  - a photo of a tree or building
+  - a photo of the sky or road surface
+  - a photo of a cardboard box
+  - a photo of a sticker or label on a box
+  - a photo of a wall, radiator or pipe
+  - a photo of a floor or road markings
+
+classes:
+  - name: STOP                       # 2.5
+    prompt: octagonal stop sign
+    desc: a red octagonal STOP traffic sign
+    max_aspect: 1.6
+    refine: color          # подогнать рамку к табличке (без стойки)
+
+  - name: parkovka                   # 6.4
+    prompt: parking sign with big letter P
+    desc: a blue square parking traffic sign with a white letter P
+    max_aspect: 1.6
+    refine: color          # подогнать рамку к табличке (без стойки)
+
+  - name: ystypi dorogy              # 2.4
+    prompt: upside down triangle yield sign
+    desc: an inverted white triangle traffic sign with red border, give way sign
+    max_aspect: 1.6
+    refine: color          # подогнать рамку к табличке (без стойки)
+
+  - name: dorozhnie raboti           # 1.25
+    prompt: roadwork warning sign with worker
+    desc: a white triangular warning traffic sign with red border showing a worker with a shovel
+    max_aspect: 1.6
+    refine: color          # подогнать рамку к табличке (без стойки)
+
+  - name: peshehodniy perehod        # 5.19
+    prompt: pedestrian crosswalk sign with walking person
+    desc: a blue square pedestrian crossing traffic sign with a walking person on a white triangle
+    max_aspect: 1.6
+    refine: color          # подогнать рамку к табличке (без стойки)
+
+  - name: iskusstvennaya nerovnost   # 1.17
+    prompt: speed bump warning sign
+    desc: a white triangular warning traffic sign with red border showing a speed bump
+    max_aspect: 1.6
+    refine: color          # подогнать рамку к табличке (без стойки)
+
+  - name: viezd zapreshen            # 3.1
+    prompt: round sign with red border and white center
+    desc: a round traffic sign, white circle with a thick red border and nothing inside
+    max_aspect: 1.6
+    refine: color          # подогнать рамку к табличке (без стойки)
+
+  - name: traffic                    # светофор
+    prompt: traffic light
+    desc: a photo of a traffic light with red, yellow and green signals
+    max_aspect: 4
