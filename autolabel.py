@@ -1421,6 +1421,50 @@ def prepare(a):
     return paths
 
 
+def make_judge(a, classes):
+    """VLM-судья (vlm.py): локально через Ollama или через OpenAI-совместимый API."""
+    if not a.vlm or a.vlm == "off":
+        return None
+    try:
+        import vlm as V
+    except ImportError:
+        log("[!] нет vlm.py рядом со скриптом — VLM выключена")
+        return None
+    if a.vlm == "ollama":
+        url = a.vlm_url or V.OLLAMA_URL
+        ok, have, err = V.ollama_status(url)
+        if not ok:
+            log(f"[!] Ollama не запущена ({err}). Установите с https://ollama.com и запустите — VLM выключена")
+            return None
+        if not any(m == a.vlm_model or m.split(":")[0] + ":latest" == a.vlm_model or
+                   (":" not in a.vlm_model and m.startswith(a.vlm_model + ":")) for m in have):
+            if a.offline:
+                log(f"[!] модели {a.vlm_model} нет в Ollama, а скачивать запрещено (--offline) — VLM выключена")
+                return None
+            log(f"[↓] скачиваю {a.vlm_model} в Ollama...")
+            last = [0.0]
+
+            def prog(st, pct):
+                if time.time() - last[0] > 2:
+                    last[0] = time.time()
+                    print(f"\r    {st} {'' if pct is None else f'{pct:5.1f}%'}      ", end="", flush=True)
+            try:
+                V.ollama_pull(a.vlm_model, url, prog)
+                print()
+            except Exception as e:
+                log(f"\n[!] не удалось скачать {a.vlm_model}: {e} — VLM выключена")
+                return None
+        j = V.VLMJudge("ollama", a.vlm_model, classes, url, timeout=180, context=a.vlm_context)
+    else:
+        if not a.vlm_url:
+            log("[!] для --vlm openai нужен --vlm-url (адрес API) — VLM выключена")
+            return None
+        j = V.VLMJudge("openai", a.vlm_model, classes, a.vlm_url, a.vlm_key, a.proxy,
+                       workers=a.vlm_workers, context=a.vlm_context)
+    log(f"[i] VLM-судья: {j.describe()}; проверяю {'все рамки' if a.vlm_mode == 'all' else 'сомнительные рамки'}")
+    return j
+
+
 def cmd_init(a):
     p = Path(a.out)
     if p.exists() and not a.force:
@@ -1543,6 +1587,7 @@ def cmd_run(a):
             log(f"[!] YOLO-World не запустился ({e}) [{where}], работаю без него.\n"
                 f"    Проверьте сеть: python autolabel.py net  (или укажите --proxy адрес:порт)")
     clf = ClipClf(paths["clip"], device, classes, cfg["reject"], a.refs, a.ref_min) if paths["clip"] else None
+    judge = make_judge(a, classes)
 
     out = Path(a.out)
     obj = out / "obj"
@@ -1641,7 +1686,61 @@ def cmd_run(a):
         ok = [bool(P[i].argmax() != C and P[i].max() >= a.low) for i in range(len(B))]
         keep, n = resolve_nested(B, keep, ok, [lim[c] for c in cbest], a.contain)
         stats["рамок убрано: вложенные"] += n
-        return [{"box": B[i], "det": fused[i][1], "p": P[i], "rej": float(RS[i])} for i in keep]
+        vlm_mark = {}
+        if judge is not None and keep:
+            vlm_mark = vlm_check(pil, B, P, RS, keep)
+        return [{"box": B[i], "det": fused[i][1], "p": P[i], "rej": float(RS[i]), "vlm": vlm_mark.get(i)}
+                for i in keep]
+
+    def vlm_check(pil, B, P, RS, keep):
+        """Сомнительные (или все) рамки — на проверку VLM; её ответ решает класс."""
+        nonlocal judge
+        send = []
+        for i in keep:
+            hard = RS[i] >= a.reject_sim and P[i, C] >= 0.999
+            top = float(P[i, :C].max())
+            c = int(P[i, :C].argmax())
+            thr = float(classes[c].get("thr", a.accept))
+            sure = P[i].argmax() != C and P[i, c] >= thr
+            if hard or top < a.vlm_low:
+                continue
+            if a.vlm_mode == "all" or not sure:
+                send.append(i)
+        if not send:
+            return {}
+        rgb = np.asarray(pil)
+        Hh, Ww = rgb.shape[:2]
+        crops = []
+        for i in send:
+            x1, y1, x2, y2 = B[i]
+            pw, ph = 0.25 * (x2 - x1) + 4, 0.25 * (y2 - y1) + 4
+            cr = rgb[int(max(0, y1 - ph)):int(min(Hh, y2 + ph)), int(max(0, x1 - pw)):int(min(Ww, x2 + pw))]
+            crops.append(cv2.cvtColor(np.ascontiguousarray(cr), cv2.COLOR_RGB2BGR))
+        res = judge.ask_many(crops)
+        marks = {}
+        for i, (k, q, raw) in zip(send, res):
+            if k is None:
+                stats["VLM: ошибок"] += 1
+                continue
+            stats["VLM: проверено рамок"] += 1
+            old = int(P[i].argmax())
+            if k == -1:
+                P[i] = 0.0
+                P[i, C] = 1.0
+                stats["VLM: выбросил"] += int(old != C)
+                marks[i] = "none"
+            else:
+                thr = float(classes[k].get("thr", a.accept))
+                v = min(0.99, max(q, thr + 0.02))
+                P[i] = 0.0
+                P[i, k] = v
+                P[i, C] = 1.0 - v
+                stats["VLM: подтвердил" if old == k else "VLM: сменил класс"] += 1
+                marks[i] = names[k]
+        if judge.fails >= 6:
+            log(f"[!] VLM не отвечает 6 раз подряд ({judge.last_error}) — дальше размечаю без неё")
+            judge = None
+        return marks
 
     def finalize(frames):
         if not frames:
@@ -1792,6 +1891,8 @@ def cmd_run(a):
             mark = ""
             if r > 0:
                 mark = f" (сходство с _reject {r:.2f}{' → ВЫБРОШЕНО' if c == C and r >= a.reject_sim else ''})"
+            if d.get("vlm"):
+                mark += " ← VLM"
             guess.append(f"{'не объект' if c == C else names[c]} {float(d['p'][c]):.2f}{mark}")
         log(f"[кадр {seen}] {(state['last'] - t0) / seen:.1f} с/кадр | на кадре: {', '.join(guess) or 'ничего'}\n"
             f"           сохранено кадров: {len(files)} | " +
@@ -1830,18 +1931,20 @@ def cmd_run(a):
                 c = int(d["p"].argmax())
                 conf = float(d["p"][c])
                 b = [int(v) for v in d["box"]]
+                vm = " [VLM]" if d.get("vlm") else ""
                 if c == C:
-                    st, col, txt = "reject", (140, 140, 140), (f"мусор {d.get('rej', 0):.2f}"
-                                                               if d.get("rej", 0) >= a.reject_sim else
-                                                               f"не объект {conf:.2f}")
+                    st, col, txt = "reject", (140, 140, 140), ((f"trash {d.get('rej', 0):.2f}"
+                                                                if d.get("rej", 0) >= a.reject_sim else
+                                                                f"not object {conf:.2f}") + vm)
                 elif elong(d["box"]) > lim[c]:
-                    st, col, txt = "shape", (140, 140, 140), f"форма ({names[c]})"
+                    st, col, txt = "shape", (140, 140, 140), f"bad shape ({names[c]})"
                 elif conf >= float(classes[c].get("thr", a.accept)):
-                    st, col, txt = "ok", colors[c], f"{names[c]} {conf:.2f}"
+                    st, col, txt = "ok", colors[c], f"{names[c]} {conf:.2f}{vm}"
                 elif conf >= a.low:
-                    st, col, txt = "unsure", (0, 215, 255), f"? {names[c]} {conf:.2f}"
+                    st, col, txt = "unsure", (0, 215, 255), f"? {names[c]} {conf:.2f}{vm}"
                 else:
-                    st, col, txt = "low", (140, 140, 140), f"слабо {names[c]} {conf:.2f}"
+                    st, col, txt = "low", (140, 140, 140), f"weak {names[c]} {conf:.2f}"
+                txt = txt.encode("ascii", "replace").decode()
                 info["boxes"].append({"box": b, "status": st, "label": txt})
                 th = 2 if st in ("ok", "unsure") else 1
                 cv2.rectangle(vis, (b[0], b[1]), (b[2], b[3]), col, th)
@@ -2016,6 +2119,18 @@ def main():
                    help="сходство с refs/_reject, при котором рамка выбрасывается (меньше — строже)")
     q.add_argument("--reject-margin", type=float, default=0.03,
                    help="на сколько сходство с _reject должно превышать сходство с образцами классов")
+    v = p.add_argument_group("VLM-судья (визуальная языковая модель)")
+    v.add_argument("--vlm", choices=["off", "ollama", "openai"], default="off",
+                   help="ollama — локально; openai — любой OpenAI-совместимый API (агрегаторы)")
+    v.add_argument("--vlm-model", default="qwen3-vl:4b", help="модель: qwen3-vl:4b, openai/gpt-4o-mini, ...")
+    v.add_argument("--vlm-url", help="адрес: http://localhost:11434 или https://api.proxyapi.ru/v1 и т.п.")
+    v.add_argument("--vlm-key", default=os.environ.get("AUTOLABEL_VLM_KEY", ""),
+                   help="ключ API (лучше через переменную AUTOLABEL_VLM_KEY)")
+    v.add_argument("--vlm-mode", choices=["uncertain", "all"], default="uncertain",
+                   help="uncertain — только сомнительные рамки (быстро), all — все")
+    v.add_argument("--vlm-low", type=float, default=0.15, help="рамки слабее этого VLM не показываем")
+    v.add_argument("--vlm-workers", type=int, default=4, help="параллельных запросов к API")
+    v.add_argument("--vlm-context", default="", help="подсказка о сцене, напр. 'Russian road signs on a toy track'")
     q.add_argument("--track", action="store_true",
                    help="голосование за класс по треку (точнее, но метки пишутся пачками по --window кадров)")
     q.add_argument("--track-iou", type=float, default=0.3)

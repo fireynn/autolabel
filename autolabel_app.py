@@ -48,12 +48,17 @@ if AL.NO_PROXY_MODE:
 AL.ensure_packages({"PyQt5": "PyQt5", "cv2": "opencv-python", "numpy": "numpy", "yaml": "pyyaml"})
 
 import cv2  # noqa: E402
+try:
+    import vlm as VLM  # noqa: E402
+except ImportError:
+    VLM = None
 import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 from PyQt5.QtCore import (QPoint, QPointF, QProcess, QProcessEnvironment, QRectF, QSize, Qt, QThread,  # noqa: E402
                           QTimer, pyqtSignal)
-from PyQt5.QtGui import (QBrush, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen,  # noqa: E402
-                         QPixmap, QTextCursor)
+from PyQt5.QtGui import (QBrush, QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QPainter,  # noqa: E402
+                         QPalette, QPen, QPixmap, QTextCursor)
+from PyQt5.QtCore import QUrl  # noqa: E402
 from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,  # noqa: E402
                              QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
                              QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -382,6 +387,41 @@ class ThumbWorker(QThread):
             self.ready.emit(key, bgr_to_qimage(thumb_square(cr, self.size)), feature(cr))
 
 
+class Task(QThread):
+    """Выполнить функцию в фоне: fn(report) ; report(text) -> сигнал msg."""
+    msg = pyqtSignal(str)
+    item = pyqtSignal(object)
+    done = pyqtSignal(object)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn, self.stop_flag = fn, False
+
+    def run(self):
+        try:
+            res = self.fn(self)
+        except Exception as e:
+            res = e
+        self.done.emit(res)
+
+
+def normalize_classes(raw, names=None):
+    """Классы из таблицы/yaml -> формат autolabel (prompts/desc — списки), в порядке names."""
+    out = []
+    by = {}
+    for c in raw:
+        c = dict(c)
+        pr = c.get("prompts") or c.get("prompt") or c["name"]
+        c["prompts"] = [pr] if isinstance(pr, str) else list(pr)
+        d = c.get("desc") or []
+        c["desc"] = [d] if isinstance(d, str) else list(d)
+        by[c["name"]] = c
+        out.append(c)
+    if names:
+        out = [by.get(n, {"name": n, "prompts": [n.replace("_", " ")], "desc": []}) for n in names]
+    return out
+
+
 # ============================================================================ запуск процессов
 
 class Console(QPlainTextEdit):
@@ -424,6 +464,9 @@ class Runner(QWidget):
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONIOENCODING", "utf-8")
         env.insert("PYTHONUNBUFFERED", "1")
+        key = os.environ.get("AUTOLABEL_VLM_KEY", "")
+        if key:
+            env.insert("AUTOLABEL_VLM_KEY", key)
         if AL.NO_PROXY_MODE:
             for k in AL.PROXY_KEYS:
                 env.remove(k)
@@ -898,6 +941,11 @@ class RunTab(QWidget):
         for t, v in (("авто", ""), ("видеокарта (cuda)", "cuda"), ("процессор (cpu)", "cpu")):
             self.device.addItem(t, v)
         gf.addRow("Устройство:", self.device)
+        self.vlm_lbl = QLabel("VLM: выключена (вкладка 8)")
+        vb = QHBoxLayout()
+        vb.addWidget(self.vlm_lbl, 1)
+        vb.addWidget(button("Настроить", lambda: self.main.tabs.setCurrentWidget(self.main.vlm_tab)))
+        gf.addRow("Судья:", vb)
         fl.addWidget(g)
 
         g = QGroupBox("Кадры")
@@ -1152,6 +1200,7 @@ class RunTab(QWidget):
             args.append("--track")
         if self.preview.isChecked():
             args.append("--preview")
+        args += self.main.vlm_tab.run_args()
         net = self.main.settings.get("net", {})
         if net.get("no_proxy", True):
             args.append("--no-proxy")
@@ -1345,6 +1394,8 @@ class CleanTab(QWidget):
             "F — удалить кадры целиком<br>"
             "P — выделить похожие<br>"
             "Enter / двойной клик — открыть кадр<br>"
+            "V — проверить через VLM<br>"
+            "A — принять ответы VLM<br>"
             "Ctrl+A — всё, Ctrl+Z — отменить")
         help_.setStyleSheet("color:#aaa")
         left.addWidget(help_)
@@ -1408,9 +1459,21 @@ class CleanTab(QWidget):
         act.addWidget(button("Удалить кадры (F)", self.act_frames, "Кадры целиком — в корзину _trash"))
         act.addWidget(button("Отменить (Ctrl+Z)", self.undo))
         center.addLayout(act)
+        act = QHBoxLayout()
+        self.vlm_btn = button("🤖 Проверить через VLM (V)", self.vlm_check,
+                              "Отправить выделенные вырезки VLM-судье; несогласные будут подсвечены и выделены")
+        act.addWidget(self.vlm_btn)
+        act.addWidget(button("Принять ответы VLM (A)", self.vlm_apply,
+                             "Для выделенных: сменить класс на ответ VLM, а «ничего» — удалить рамку"))
+        self.vlm_lbl = QLabel("")
+        act.addWidget(self.vlm_lbl, 1)
+        center.addLayout(act)
         lay.addLayout(center, 1)
 
+        self.vlm_ans = {}     # key -> (класс|-1, уверенность)
+        self.vlm_task = None
         for key, fn in (("Delete", self.act_delete), ("R", self.act_reject), ("S", self.act_sample),
+                        ("V", self.vlm_check), ("A", self.vlm_apply),
                         ("F", self.act_frames), ("P", self.select_similar), ("Ctrl+Z", self.undo),
                         ("Return", lambda: self.open_frame(self.grid.currentItem()))):
             sc = QShortcut(QKeySequence(key), self.grid)
@@ -1502,6 +1565,7 @@ class CleanTab(QWidget):
             it = QListWidgetItem(QIcon(self.thumbs[key]) if key in self.thumbs else ph_icon, label)
             it.setData(Qt.UserRole, (fr.stem, i))
             it.setData(Qt.UserRole + 1, key)
+            it.setData(Qt.UserRole + 2, label)
             name = self.ds.names[b.c] if 0 <= b.c < len(self.ds.names) else f"?{b.c}"
             it.setToolTip(f"{name}\nкадр {fr.stem}\nуверенность: {b.conf if b.conf is not None else '—'}")
             if self.cur_class is None:
@@ -1510,6 +1574,8 @@ class CleanTab(QWidget):
                 it.setBackground(QBrush(QColor(90, 70, 20)))
             self.grid.addItem(it)
             self.items[key] = it
+            if key in self.vlm_ans:
+                self._mark_vlm(it, b.c, *self.vlm_ans[key])
             if key not in self.thumbs:
                 jobs.append((key, fr.img, (b.xc, b.yc, b.w, b.h)))
         self.grid.setUpdatesEnabled(True)
@@ -1668,6 +1734,109 @@ class CleanTab(QWidget):
         self.on_sel()
         self.main.status(f"Добавлено к выделению похожих: {n}. Проверьте глазами и жмите действие")
 
+    # ---------------------------------------------------------------- VLM
+    def _mark_vlm(self, it, cur_c, k, q):
+        names = self.ds.names
+        ans = "ничего" if k == -1 else (names[k] if 0 <= k < len(names) else "?")
+        agree = k == cur_c
+        it.setBackground(QBrush(QColor(30, 90, 40) if agree else QColor(140, 70, 20)))
+        it.setText(f"✓ {it.data(Qt.UserRole + 2)}" if agree else f"VLM: {ans}")
+        it.setToolTip(it.toolTip().split("\nVLM:")[0] + f"\nVLM: {ans} ({q:.2f})")
+
+    def vlm_check(self):
+        if self.ds is None:
+            return
+        if self.vlm_task and self.vlm_task.isRunning():
+            self.vlm_task.stop_flag = True
+            self.vlm_btn.setText("🤖 Проверить через VLM (V)")
+            return
+        items = self.grid.selectedItems()
+        if not items:
+            self.main.status("Выделите вырезки (Ctrl+A — все на экране)")
+            return
+        judge = self.main.vlm_tab.make_judge(self.ds.names)
+        if judge is None:
+            return
+        jobs = []
+        for it in items:
+            s_, i = it.data(Qt.UserRole)
+            cr = self._crop(s_, i, pad=0.25)
+            if cr is not None and cr.size:
+                jobs.append((it.data(Qt.UserRole + 1), self.ds.frames[s_].boxes[i].c, cr.copy()))
+        self.vlm_lbl.setText(f"VLM: 0 / {len(jobs)} ...")
+        self.vlm_btn.setText("■ Остановить VLM")
+        state = {"n": 0, "dis": 0, "err": 0}
+
+        def fn(t):
+            step = max(1, judge.workers)
+            for k0 in range(0, len(jobs), step):
+                if t.stop_flag:
+                    break
+                chunk = jobs[k0:k0 + step]
+                for (key, c, _), res in zip(chunk, judge.ask_many([j[2] for j in chunk])):
+                    t.item.emit((key, c, res))
+                if judge.fails >= 5:
+                    return RuntimeError(judge.last_error)
+            return None
+
+        def on_item(v):
+            key, c, (k, q, raw) = v
+            state["n"] += 1
+            if k is None:
+                state["err"] += 1
+            else:
+                self.vlm_ans[key] = (k, q)
+                state["dis"] += k != c
+                it = self.items.get(key)
+                if it is not None:
+                    self._mark_vlm(it, c, k, q)
+            self.vlm_lbl.setText(f"VLM: {state['n']} / {len(jobs)}, не согласна: {state['dis']}"
+                                 + (f", ошибок: {state['err']}" if state["err"] else ""))
+
+        def done(res):
+            self.vlm_btn.setText("🤖 Проверить через VLM (V)")
+            self.grid.clearSelection()
+            self.grid.blockSignals(True)
+            for key, (k, q) in self.vlm_ans.items():
+                it = self.items.get(key)
+                if it is not None:
+                    s_, i = it.data(Qt.UserRole)
+                    if self.ds.frames.get(s_) and k != self.ds.frames[s_].boxes[i].c:
+                        it.setSelected(True)
+            self.grid.blockSignals(False)
+            self.on_sel()
+            msg = f"VLM проверила {state['n']}: не согласна с {state['dis']} — они выделены (оранжевые). " \
+                  f"Посмотрите и нажмите «Принять ответы VLM» (A) или исправьте вручную"
+            if isinstance(res, Exception):
+                msg = f"VLM остановлена: {res}"
+            self.main.status(msg)
+        self.vlm_task = Task(fn)
+        self.vlm_task.item.connect(on_item)
+        self.vlm_task.done.connect(done)
+        self.vlm_task.start()
+
+    def vlm_apply(self):
+        items = [it for it in self.grid.selectedItems() if it.data(Qt.UserRole + 1) in self.vlm_ans]
+        if not items or self.ds is None:
+            self.main.status("Выделите вырезки, проверенные VLM (оранжевые)")
+            return
+        sel = [(it.data(Qt.UserRole), self.vlm_ans[it.data(Qt.UserRole + 1)][0]) for it in items]
+        stems = sorted({s_ for (s_, _), _ in sel})
+        self.undo_stack.append(("boxes", self.ds.snapshot(stems)))
+        nd = nc = 0
+        for (s_, i), k in sel:
+            b = self.ds.frames[s_].boxes[i]
+            if k == -1:
+                b.alive = False
+                nd += 1
+            elif k != b.c:
+                b.c = k
+                nc += 1
+        self.ds.save(stems)
+        self.main.frames_tab.mark_dirty()
+        self.refresh()
+        self.main.status(f"Ответы VLM приняты: класс изменён у {nc}, удалено {nd}  (Ctrl+Z — отменить)")
+
     def open_frame(self, item):
         if item is None:
             return
@@ -1681,6 +1850,8 @@ class CleanTab(QWidget):
         m = QMenu(self)
         m.addAction("Открыть кадр", lambda: self.open_frame(self.grid.currentItem()))
         m.addAction("Выделить похожие", self.select_similar)
+        m.addAction("Проверить через VLM", self.vlm_check)
+        m.addAction("Принять ответы VLM", self.vlm_apply)
         m.addSeparator()
         m.addAction("Удалить рамки", self.act_delete)
         sub = m.addMenu("Сменить класс")
@@ -2547,6 +2718,356 @@ class NetTab(QWidget):
         self.runner.start(["-c", code], script=None)
 
 
+# ============================================================================ 8. VLM-судья
+
+class VLMTab(QWidget):
+    MODES = (("Выключена", "off"), ("Локально — Ollama (бесплатно, на вашей видеокарте)", "ollama"),
+             ("API — агрегатор / OpenAI-совместимый (платно, нужен интернет)", "openai"))
+
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.task = None
+        s = self.main.settings.get("vlm", {})
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        lay = QVBoxLayout(inner)
+        if VLM is None:
+            lay.addWidget(QLabel("<b style='color:#f66'>Рядом нет vlm.py — положите его в папку с приложением.</b>"))
+
+        info = QLabel("<b>VLM-судья</b> — визуальная языковая модель смотрит на вырезку и говорит, какой это класс "
+                      "или «ничего из списка». При разметке ей отдаются <b>только сомнительные рамки</b> — "
+                      "это убирает путаницу похожих знаков и ложные срабатывания почти без потери скорости. "
+                      "Во вкладке «Чистка» можно проверить выделенные вырезки кнопкой «Проверить через VLM».")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        top = QFormLayout()
+        self.mode = QComboBox()
+        for t, v in self.MODES:
+            self.mode.addItem(t, v)
+        self.mode.setCurrentIndex(max(0, self.mode.findData(s.get("mode", "off"))))
+        self.mode.currentIndexChanged.connect(self.on_mode)
+        top.addRow("<b>Режим:</b>", self.mode)
+        self.check = QComboBox()
+        self.check.addItem("только сомнительные рамки (рекомендуется)", "uncertain")
+        self.check.addItem("все рамки (медленно, но строже)", "all")
+        self.check.setCurrentIndex(max(0, self.check.findData(s.get("check", "uncertain"))))
+        top.addRow("При разметке проверять:", self.check)
+        self.context = QLineEdit(s.get("context", ""))
+        self.context.setPlaceholderText("подсказка о сцене (англ.), напр.: Russian road signs on a toy model track")
+        top.addRow("Подсказка о сцене:", self.context)
+        lay.addLayout(top)
+
+        # ---------------- локально
+        self.g_local = QGroupBox("Локально через Ollama")
+        gl = QVBoxLayout(self.g_local)
+        st = QHBoxLayout()
+        self.ollama_lbl = QLabel("Ollama: не проверено")
+        st.addWidget(self.ollama_lbl, 1)
+        st.addWidget(button("Проверить", self.check_ollama))
+        st.addWidget(button("Установить Ollama", self.install_ollama, "Скачать и запустить установщик с ollama.com"))
+        gl.addLayout(st)
+        self.models = QTableWidget(0, 5)
+        self.models.setHorizontalHeaderLabels(["Модель", "Скачать", "Видеопамять", "Описание", "Скачана"])
+        self.models.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        for i in (0, 1, 2, 4):
+            self.models.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        self.models.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.models.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.models.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.models.verticalHeader().setVisible(False)
+        for row in (VLM.LOCAL_MODELS if VLM else []):
+            r = self.models.rowCount()
+            self.models.insertRow(r)
+            for c, v in enumerate(row):
+                self.models.setItem(r, c, QTableWidgetItem(v))
+            self.models.setItem(r, 4, QTableWidgetItem(""))
+        self.models.itemSelectionChanged.connect(self.on_pick_local)
+        self.models.setMinimumHeight(30 + 30 * self.models.rowCount())
+        gl.addWidget(self.models)
+        f = QFormLayout()
+        self.local_model = QLineEdit(s.get("local_model", "qwen3-vl:4b"))
+        self.local_model.setToolTip("Можно вписать любую модель Ollama с поддержкой картинок")
+        mb = QHBoxLayout()
+        mb.addWidget(self.local_model)
+        mb.addWidget(button("Скачать модель", self.pull))
+        f.addRow("Модель:", mb)
+        self.local_url = QLineEdit(s.get("local_url", "http://localhost:11434"))
+        f.addRow("Адрес Ollama:", self.local_url)
+        gl.addLayout(f)
+        self.pull_bar = QProgressBar()
+        self.pull_bar.setVisible(False)
+        gl.addWidget(self.pull_bar)
+        lay.addWidget(self.g_local)
+
+        # ---------------- API
+        self.g_api = QGroupBox("API — российские агрегаторы (оплата в рублях) и другие OpenAI-совместимые")
+        ga = QFormLayout(self.g_api)
+        self.provider = QComboBox()
+        for name, url, model, site in (VLM.API_PROVIDERS if VLM else []):
+            self.provider.addItem(name, (url, model, site))
+        i = self.provider.findText(s.get("provider", "ProxyAPI"))
+        self.provider.setCurrentIndex(max(0, i))
+        self.provider.currentIndexChanged.connect(self.on_provider)
+        pb = QHBoxLayout()
+        pb.addWidget(self.provider, 1)
+        self.site_btn = button("Сайт / получить ключ", self.open_site)
+        pb.addWidget(self.site_btn)
+        ga.addRow("Сервис:", pb)
+        self.url = QLineEdit(s.get("url", ""))
+        ga.addRow("Адрес (base_url):", self.url)
+        self.key = QLineEdit(s.get("key", ""))
+        self.key.setEchoMode(QLineEdit.Password)
+        self.key.setPlaceholderText("ключ API из личного кабинета сервиса")
+        kb = QHBoxLayout()
+        kb.addWidget(self.key)
+        show = QToolButton()
+        show.setText("👁")
+        show.setCheckable(True)
+        show.toggled.connect(lambda on: self.key.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password))
+        kb.addWidget(show)
+        ga.addRow("Ключ:", kb)
+        self.api_model = QComboBox()
+        self.api_model.setEditable(True)
+        for m in (VLM.API_MODEL_HINTS if VLM else []):
+            self.api_model.addItem(m)
+        self.api_model.setCurrentText(s.get("model", "openai/gpt-4o-mini"))
+        mb = QHBoxLayout()
+        mb.addWidget(self.api_model, 1)
+        mb.addWidget(button("Список моделей", self.list_models, "Загрузить список моделей с сервиса"))
+        ga.addRow("Модель (с картинками):", mb)
+        self.workers = QSpinBox()
+        self.workers.setRange(1, 16)
+        self.workers.setValue(s.get("workers", 4))
+        ga.addRow("Параллельных запросов:", self.workers)
+        note = QLabel("Ключ хранится только в autolabel_app.json на этом компьютере. Модель должна понимать "
+                      "картинки (vision): gpt-4o-mini, gpt-4.1-mini, claude, gemini, qwen-vl. Точное имя "
+                      "у каждого сервиса своё — нажмите «Список моделей». Через API уходят только вырезки "
+                      "объектов, не целые кадры.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#aaa")
+        ga.addRow(note)
+        lay.addWidget(self.g_api)
+
+        tb = QHBoxLayout()
+        tb.addWidget(button("Проверить на картинке...", self.test_image,
+                            "Выберите вырезку объекта — модель скажет, какой это класс"))
+        tb.addStretch()
+        lay.addLayout(tb)
+        self.out = Console()
+        self.out.setMaximumHeight(170)
+        lay.addWidget(self.out)
+        lay.addStretch()
+        if not self.url.text():
+            self.on_provider()
+        self.on_mode()
+
+    # ---------------------------------------------------------------- настройки
+    def store(self):
+        self.main.settings["vlm"] = {
+            "mode": self.mode.currentData(), "check": self.check.currentData(), "context": self.context.text(),
+            "local_model": self.local_model.text().strip(), "local_url": self.local_url.text().strip(),
+            "provider": self.provider.currentText(), "url": self.url.text().strip(), "key": self.key.text().strip(),
+            "model": self.api_model.currentText().strip(), "workers": self.workers.value()}
+        os.environ["AUTOLABEL_VLM_KEY"] = self.key.text().strip()
+
+    def on_mode(self):
+        m = self.mode.currentData()
+        self.g_local.setEnabled(m == "ollama")
+        self.g_api.setEnabled(m == "openai")
+        self.store()
+        rt = getattr(self.main, "run_tab", None)
+        if rt is not None and hasattr(rt, "vlm_lbl"):
+            rt.vlm_lbl.setText(self.summary())
+
+    def summary(self):
+        m = self.mode.currentData()
+        if m == "ollama":
+            return f"VLM: {self.local_model.text()} (локально)"
+        if m == "openai":
+            return f"VLM: {self.api_model.currentText()} ({self.provider.currentText()})"
+        return "VLM: выключена (вкладка 8)"
+
+    def on_provider(self):
+        url, model, site = self.provider.currentData() or ("", "", "")
+        if url:
+            self.url.setText(url)
+        if model:
+            self.api_model.setCurrentText(model)
+        self.site_btn.setEnabled(bool(site))
+        self.store()
+
+    def open_site(self):
+        _, _, site = self.provider.currentData() or ("", "", "")
+        if site:
+            QDesktopServices.openUrl(QUrl(site))
+
+    def on_pick_local(self):
+        r = self.models.currentRow()
+        if r >= 0:
+            self.local_model.setText(self.models.item(r, 0).text())
+            self.store()
+
+    def run_args(self):
+        self.store()
+        m = self.mode.currentData()
+        if m == "off" or VLM is None:
+            return []
+        a = ["--vlm", m, "--vlm-mode", self.check.currentData()]
+        if self.context.text().strip():
+            a += ["--vlm-context", self.context.text().strip()]
+        if m == "ollama":
+            a += ["--vlm-model", self.local_model.text().strip(), "--vlm-url", self.local_url.text().strip()]
+        else:
+            a += ["--vlm-model", self.api_model.currentText().strip(), "--vlm-url", self.url.text().strip(),
+                  "--vlm-workers", str(self.workers.value())]
+        return a
+
+    def make_judge(self, names=None):
+        """VLMJudge по текущим настройкам; names — порядок классов датасета."""
+        self.store()
+        m = self.mode.currentData()
+        if VLM is None or m == "off":
+            QMessageBox.information(self, "VLM", "Выберите режим VLM во вкладке «8. VLM-судья»")
+            self.main.tabs.setCurrentWidget(self)
+            return None
+        classes = normalize_classes(self.main.classes_tab.to_config()["classes"], names)
+        if m == "ollama":
+            return VLM.VLMJudge("ollama", self.local_model.text().strip(), classes, self.local_url.text().strip(),
+                                timeout=180, context=self.context.text().strip())
+        if not self.url.text().strip():
+            QMessageBox.warning(self, "VLM", "Укажите адрес API")
+            return None
+        proxy = None if self.main.settings.get("net", {}).get("no_proxy", True) else \
+            (self.main.settings.get("net", {}).get("proxy") or None)
+        return VLM.VLMJudge("openai", self.api_model.currentText().strip(), classes, self.url.text().strip(),
+                            self.key.text().strip(), proxy, workers=self.workers.value(),
+                            context=self.context.text().strip())
+
+    # ---------------------------------------------------------------- действия
+    def _run(self, fn, done):
+        if self.task and self.task.isRunning():
+            self.main.status("Подождите, предыдущая операция ещё идёт")
+            return
+        self.task = Task(fn)
+        self.task.msg.connect(lambda t: self.out.add(t + "\n"))
+        self.task.done.connect(done)
+        self.task.start()
+
+    def check_ollama(self):
+        url = self.local_url.text().strip()
+        self.ollama_lbl.setText("Ollama: проверяю...")
+
+        def done(res):
+            ok, have, err = res if isinstance(res, tuple) else (False, [], str(res))
+            if ok:
+                self.ollama_lbl.setText(f"<span style='color:#6c6'>Ollama работает</span>, скачано моделей: {len(have)}")
+            else:
+                self.ollama_lbl.setText("<span style='color:#f66'>Ollama не найдена</span> — установите и запустите "
+                                        "(значок появится в трее)")
+            for r in range(self.models.rowCount()):
+                tag = self.models.item(r, 0).text()
+                self.models.item(r, 4).setText("✓" if tag in have else "")
+        self._run(lambda t: VLM.ollama_status(url), done)
+
+    def install_ollama(self):
+        if sys.platform != "win32":
+            QDesktopServices.openUrl(QUrl("https://ollama.com/download"))
+            return
+        dst = Path(os.environ.get("TEMP", str(APP_DIR))) / "OllamaSetup.exe"
+        self.out.add("Скачиваю установщик Ollama...\n")
+
+        def fn(t):
+            s = VLM._session()
+            with s.get("https://ollama.com/download/OllamaSetup.exe", stream=True, timeout=(15, 600)) as r:
+                r.raise_for_status()
+                with open(dst, "wb") as f:
+                    for ch in r.iter_content(1 << 20):
+                        f.write(ch)
+            return dst
+
+        def done(res):
+            if isinstance(res, Exception):
+                self.out.add(f"Не скачалось ({res}). Открываю сайт — скачайте вручную.\n")
+                QDesktopServices.openUrl(QUrl("https://ollama.com/download"))
+            else:
+                self.out.add("Запускаю установщик. После установки нажмите «Проверить».\n")
+                QProcess.startDetached(str(res), [])
+        self._run(fn, done)
+
+    def pull(self):
+        model, url = self.local_model.text().strip(), self.local_url.text().strip()
+        if not model:
+            return
+        self.pull_bar.setVisible(True)
+        self.pull_bar.setRange(0, 100)
+        self.out.add(f"Скачиваю {model} в Ollama...\n")
+
+        def fn(t):
+            last = [0.0]
+
+            def prog(st, pct):
+                if time.time() - last[0] > 0.5:
+                    last[0] = time.time()
+                    t.item.emit((st, pct))
+            VLM.ollama_pull(model, url, prog)
+            return True
+
+        def done(res):
+            self.pull_bar.setVisible(False)
+            self.out.add(("Готово.\n" if res is True else f"Ошибка: {res}\nЗапущена ли Ollama?\n"))
+            self.check_ollama()
+        self._run(fn, done)
+        self.task.item.connect(lambda v: (self.pull_bar.setValue(int(v[1] or 0)),
+                                          self.pull_bar.setFormat(f"{v[0]} {v[1] or 0:.0f}%")))
+
+    def list_models(self):
+        url, key = self.url.text().strip(), self.key.text().strip()
+
+        def done(res):
+            if isinstance(res, Exception):
+                self.out.add(f"Не удалось получить список: {res}\n")
+                return
+            cur = self.api_model.currentText()
+            self.api_model.clear()
+            vis = [m for m in res if any(k in m.lower() for k in ("gpt-4o", "gpt-4.1", "gpt-5", "claude", "gemini",
+                                                                   "vl", "vision", "pixtral", "llava", "gemma-3",
+                                                                   "gemma3", "grok", "glm-4v"))]
+            for m in vis + [m for m in res if m not in vis]:
+                self.api_model.addItem(m)
+            self.api_model.setCurrentText(cur)
+            self.out.add(f"Моделей: {len(res)}, из них похожих на «с картинками» — {len(vis)} (вверху списка)\n")
+        self._run(lambda t: VLM.api_models(url, key), done)
+
+    def test_image(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Вырезка объекта", str(APP_DIR), "Картинки (*.jpg *.jpeg *.png *.bmp)")
+        if not f:
+            return
+        img = AL.imread_u(f)
+        judge = self.make_judge(self.main.dataset.names if self.main.dataset and self.main.dataset.names else None)
+        if img is None or judge is None:
+            return
+        self.out.add(f"Спрашиваю {judge.describe()}...\n")
+        t0 = time.time()
+
+        def done(res):
+            k, q, raw = res if isinstance(res, tuple) else (None, 0, str(res))
+            name = "ОШИБКА" if k is None else ("ничего из списка" if k == -1 else judge.names[k])
+            self.out.add(f"→ {name}  (уверенность {q:.2f}, {time.time() - t0:.1f} с)\n   ответ: {raw}\n")
+        self._run(lambda t: judge.ask(img), done)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self.mode.currentData() == "ollama":
+            self.check_ollama()
+
+
 # ============================================================================ главное окно
 
 class Main(QMainWindow):
@@ -2575,10 +3096,11 @@ class Main(QMainWindow):
         self.stats_tab = StatsTab(self)
         self.train_tab = TrainTab(self)
         self.net_tab = NetTab(self)
+        self.vlm_tab = VLMTab(self)
         for w, t in ((self.classes_tab, "1. Классы и образцы"), (self.run_tab, "2. Разметка"),
                      (self.clean_tab, "3. Чистка"), (self.frames_tab, "4. Кадры"),
                      (self.stats_tab, "5. Статистика"), (self.train_tab, "6. Обучение"),
-                     (self.net_tab, "7. Сеть и модели")):
+                     (self.net_tab, "7. Сеть и модели"), (self.vlm_tab, "8. VLM-судья")):
             self.tabs.addTab(w, t)
         central = QWidget()
         cl = QVBoxLayout(central)
@@ -2635,6 +3157,7 @@ class Main(QMainWindow):
 
     def save_settings(self):
         self.run_tab.store_settings()
+        self.vlm_tab.store()
         self.net_tab.store()
         self.settings["tab"] = self.tabs.currentIndex()
         save_settings(self.settings)

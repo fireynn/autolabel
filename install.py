@@ -30,7 +30,8 @@ VPY = VENV / ("Scripts/python.exe" if WIN else "bin/python")
 MARK = VENV / ".installed_ok"
 
 TORCH_VER, VISION_VER = "2.7.1", "0.22.1"
-PACKAGES = ["transformers>=4.45,<5", "opencv-python>=4.8", "pillow", "pyyaml", "numpy", "requests", "PyQt5"]
+PACKAGES = ["transformers>=4.45,<5", "opencv-python>=4.8,<5", "pillow", "pyyaml", "numpy", "requests", "PyQt5",
+            "ultralytics"]
 PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "PIP_PROXY")
 
 DRY = False
