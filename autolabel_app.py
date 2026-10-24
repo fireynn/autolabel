@@ -2846,7 +2846,50 @@ class VLMTab(QWidget):
         self.workers.setRange(1, 16)
         self.workers.setValue(s.get("workers", 4))
         ga.addRow("Параллельных запросов:", self.workers)
-        note = QLabel("Ключ хранится только в autolabel_app.json на этом компьютере. Модель должна понимать "
+
+        # цены
+        pr = QHBoxLayout()
+        self.rate = QDoubleSpinBox()
+        self.rate.setRange(1, 1000)
+        self.rate.setValue(s.get("rate", 83.0))
+        self.rate.setSuffix(" ₽ за $")
+        self.rate.setToolTip("Курс доллара (ЦБ 20.10.2026: 82,85 ₽)")
+        self.markup = QDoubleSpinBox()
+        self.markup.setRange(1, 10)
+        self.markup.setSingleStep(0.1)
+        self.markup.setValue(s.get("markup", 2.0))
+        self.markup.setPrefix("наценка ×")
+        self.markup.setToolTip("Агрегаторы продают дороже официальной цены: обычно в 1.2–3 раза "
+                               "(у некоторых моделей до 5–6)")
+        self.rate.valueChanged.connect(self.fill_prices)
+        self.markup.valueChanged.connect(self.fill_prices)
+        pr.addWidget(self.rate)
+        pr.addWidget(self.markup)
+        pr.addWidget(button("Цены с OpenRouter (живые)", self.live_prices,
+                            "Загрузить актуальный список моделей с картинками и цены (интернет, без ключа)"))
+        pr.addStretch()
+        ga.addRow("Цены:", pr)
+        self.prices = QTableWidget(0, 6)
+        self.prices.setHorizontalHeaderLabels(["Модель (id как в OpenRouter)", "Вход $/1М", "Выход $/1М",
+                                               "≈ $ за 1000 вырезок", "≈ ₽ за 1000 (с наценкой)", "Примечание"])
+        hh = self.prices.horizontalHeader()
+        for i in range(5):
+            hh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.Stretch)
+        self.prices.verticalHeader().setVisible(False)
+        self.prices.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.prices.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.prices.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.prices.setSortingEnabled(True)
+        self.prices.setMinimumHeight(330)
+        self.prices.itemSelectionChanged.connect(self.on_pick_price)
+        ga.addRow(self.prices)
+        self.price_rows = [tuple(r) for r in (VLM.API_PRICES if VLM else [])]
+        self.fill_prices()
+        note = QLabel("Цены примерные (официальные, октябрь 2026) — у агрегатора в рублях будет дороже; точную "
+                      "цену смотрите в его каталоге. Вырезка ≈ 300 токенов текста + 250–400 токенов картинки "
+                      "(у gpt-4o-mini картинка «весит» ~8500). Сомнительных рамок обычно 5–20% от всех. "
+                      "Ключ хранится только в autolabel_app.json на этом компьютере. Модель должна понимать "
                       "картинки (vision): gpt-4o-mini, gpt-4.1-mini, claude, gemini, qwen-vl. Точное имя "
                       "у каждого сервиса своё — нажмите «Список моделей». Через API уходят только вырезки "
                       "объектов, не целые кадры.")
@@ -2858,7 +2901,13 @@ class VLMTab(QWidget):
         tb = QHBoxLayout()
         tb.addWidget(button("Проверить на картинке...", self.test_image,
                             "Выберите вырезку объекта — модель скажет, какой это класс"))
+        tb.addWidget(button("Показать запрос", self.show_prompt, "Текст, который уходит модели вместе с картинкой"))
         tb.addStretch()
+        self.preview = QLabel()
+        self.preview.setFixedSize(164, 164)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setStyleSheet("background:#1b1b1b; border:1px solid #333")
+        tb.addWidget(self.preview)
         lay.addLayout(tb)
         self.out = Console()
         self.out.setMaximumHeight(170)
@@ -2874,7 +2923,9 @@ class VLMTab(QWidget):
             "mode": self.mode.currentData(), "check": self.check.currentData(), "context": self.context.text(),
             "local_model": self.local_model.text().strip(), "local_url": self.local_url.text().strip(),
             "provider": self.provider.currentText(), "url": self.url.text().strip(), "key": self.key.text().strip(),
-            "model": self.api_model.currentText().strip(), "workers": self.workers.value()}
+            "model": self.api_model.currentText().strip(), "workers": self.workers.value(),
+            "rate": self.rate.value() if hasattr(self, "rate") else 83.0,
+            "markup": self.markup.value() if hasattr(self, "markup") else 2.0}
         os.environ["AUTOLABEL_VLM_KEY"] = self.key.text().strip()
 
     def on_mode(self):
@@ -2907,6 +2958,64 @@ class VLMTab(QWidget):
         _, _, site = self.provider.currentData() or ("", "", "")
         if site:
             QDesktopServices.openUrl(QUrl(site))
+
+    def fill_prices(self):
+        rate, mk = self.rate.value(), self.markup.value()
+        self.prices.setSortingEnabled(False)
+        self.prices.setRowCount(len(self.price_rows))
+
+        class Num(QTableWidgetItem):
+            def __init__(self, v, fmt):
+                super().__init__("?" if v is None else fmt.format(v))
+                self.v = 1e9 if v is None else v
+
+            def __lt__(self, other):
+                return self.v < getattr(other, "v", 0)
+        for r, row in enumerate(self.price_rows):
+            mid, pi, po = row[0], row[1], row[2]
+            it = row[3] if len(row) > 3 else 400
+            note = row[4] if len(row) > 4 else ""
+            c = VLM.cost_per_1000(pi, po, it)
+            self.prices.setItem(r, 0, QTableWidgetItem(mid))
+            self.prices.setItem(r, 1, Num(pi, "{:.2f}"))
+            self.prices.setItem(r, 2, Num(po, "{:.2f}"))
+            self.prices.setItem(r, 3, Num(c, "${:.3f}"))
+            self.prices.setItem(r, 4, Num(None if c is None else c * rate * mk, "{:.1f} ₽"))
+            n = QTableWidgetItem(note)
+            if "★" in note:
+                n.setForeground(QBrush(QColor("#6c6")))
+            self.prices.setItem(r, 5, n)
+        self.prices.setSortingEnabled(True)
+        self.store()
+
+    def on_pick_price(self):
+        r = self.prices.currentRow()
+        if r >= 0 and self.prices.item(r, 0):
+            mid = self.prices.item(r, 0).text()
+            prov = self.provider.currentText()
+            if prov.startswith("AITunnel") or prov in ("provod.ai", "OpenAI"):
+                mid = mid.split("/", 1)[-1]  # у этих сервисов имя без префикса
+            self.api_model.setCurrentText(mid)
+            self.store()
+
+    def live_prices(self):
+        self.out.add("Загружаю цены с OpenRouter...\n")
+        proxy = None if self.main.settings.get("net", {}).get("no_proxy", True) else \
+            (self.main.settings.get("net", {}).get("proxy") or None)
+
+        def done(res):
+            if isinstance(res, Exception):
+                self.out.add(f"Не удалось: {res}\n")
+                return
+            known = {r[0]: r for r in (VLM.API_PRICES if VLM else [])}
+            rows = []
+            for mid, pi, po in res:
+                k = known.get(mid)
+                rows.append((mid, pi, po, k[3] if k else 400, k[4] if k else ""))
+            self.price_rows = rows
+            self.fill_prices()
+            self.out.add(f"Моделей с картинками: {len(rows)}. Цены — официальные OpenRouter, $ за 1 млн токенов.\n")
+        self._run(lambda t: VLM.openrouter_prices(proxy), done)
 
     def on_pick_local(self):
         r = self.models.currentRow()
@@ -3050,17 +3159,46 @@ class VLMTab(QWidget):
         if not f:
             return
         img = AL.imread_u(f)
-        judge = self.make_judge(self.main.dataset.names if self.main.dataset and self.main.dataset.names else None)
-        if img is None or judge is None:
+        if img is None:
             return
-        self.out.add(f"Спрашиваю {judge.describe()}...\n")
+        h, w = img.shape[:2]
+        if max(h, w) > 500 and QMessageBox.question(
+                self, "Целый кадр?", f"Картинка {w}x{h} — похоже на целый кадр. VLM-судья проверяет ВЫРЕЗКУ "
+                                     f"одного объекта (знак в центре), на целом кадре она часто отвечает «ничего».\n\n"
+                                     f"Вырезки есть во вкладке «Чистка» (S — в образцы, refs/...).\nВсё равно отправить?"
+        ) != QMessageBox.Yes:
+            return
+        names = self.main.dataset.names if self.main.dataset and self.main.dataset.names else None
+        judge = self.make_judge(names)
+        if judge is None:
+            return
+        no_desc = [c["name"] for c in judge.classes if not c.get("desc")]
+        self.out.add(f"Спрашиваю {judge.describe()}...\n   классы в запросе: {', '.join(judge.names)}\n")
+        if no_desc:
+            self.out.add(f"   ! без описания (имена датасета не совпали с вкладкой «Классы»): {', '.join(no_desc)}\n")
+        sent = VLM.encode_crop(img)
+        qi = QImage.fromData(__import__("base64").b64decode(sent))
+        self.preview.setPixmap(QPixmap.fromImage(qi).scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.preview.setToolTip(f"Так видит модель: {qi.width()}x{qi.height()}")
         t0 = time.time()
 
         def done(res):
             k, q, raw = res if isinstance(res, tuple) else (None, 0, str(res))
             name = "ОШИБКА" if k is None else ("ничего из списка" if k == -1 else judge.names[k])
-            self.out.add(f"→ {name}  (уверенность {q:.2f}, {time.time() - t0:.1f} с)\n   ответ: {raw}\n")
+            seen = ""
+            m = __import__("re").search(r'"seen"\s*:\s*"([^"]*)"', str(raw))
+            if m:
+                seen = f"\n   модель видит: {m.group(1)}"
+            self.out.add(f"→ {name}  (уверенность {q:.2f}, {time.time() - t0:.1f} с){seen}\n   ответ: {raw}\n")
         self._run(lambda t: judge.ask(img), done)
+
+    def show_prompt(self):
+        if VLM is None:
+            return
+        names = self.main.dataset.names if self.main.dataset and self.main.dataset.names else None
+        classes = normalize_classes(self.main.classes_tab.to_config()["classes"], names)
+        self.out.add("----- запрос к модели -----\n" + VLM.build_prompt(classes, self.context.text().strip())
+                     + "\n---------------------------\n")
 
     def showEvent(self, e):
         super().showEvent(e)

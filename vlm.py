@@ -26,40 +26,113 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ----------------------------------------------------------------------------- каталоги
 
-# Локальные модели Ollama с картинками (размер скачивания, сколько нужно видеопамяти, оценка)
+# Локальные модели Ollama с картинками: (тег, скачать, видеопамять ~, описание)
+# Размеры — со страниц ollama.com/library (октябрь 2026), видеопамять — примерная оценка.
 LOCAL_MODELS = [
-    # tag,               скачать, VRAM,  примечание
-    ("qwen3-vl:2b",      "1.9 ГБ", "3 ГБ",  "самая лёгкая, для слабых видеокарт/CPU"),
-    ("qwen3-vl:4b",      "3.3 ГБ", "5 ГБ",  "рекомендуется для 6 ГБ видеопамяти"),
-    ("qwen3-vl:8b",      "6.2 ГБ", "8 ГБ",  "точнее, нужна карта от 8 ГБ"),
-    ("qwen2.5vl:3b",     "3.2 ГБ", "5 ГБ",  "проверенная, хорошо читает знаки"),
-    ("qwen2.5vl:7b",     "6.0 ГБ", "8 ГБ",  "точнее, нужна карта от 8 ГБ"),
-    ("gemma3:4b",        "3.4 ГБ", "5 ГБ",  "Google, хорошо понимает сцены"),
-    ("gemma3:12b",       "8.2 ГБ", "12 ГБ", "точная, нужна мощная карта"),
-    ("qwen3-vl:30b",     "20 ГБ",  "24 ГБ", "очень точная, для серверных карт"),
+    ("moondream:1.8b",          "1.7 ГБ", "2 ГБ",   "крошечная, быстрая; классы различает слабо"),
+    ("qwen3-vl:2b",             "1.9 ГБ", "3 ГБ",   "самая лёгкая из хороших; для CPU и слабых карт"),
+    ("granite3.2-vision:2b",    "2.4 ГБ", "3 ГБ",   "IBM, лёгкая; больше для документов"),
+    ("qwen2.5vl:3b",            "3.2 ГБ", "5 ГБ",   "проверенная, хорошо читает знаки и надписи"),
+    ("qwen3-vl:4b",             "3.3 ГБ", "5 ГБ",   "★ рекомендуется для 6 ГБ видеопамяти"),
+    ("gemma3:4b",               "3.4 ГБ", "5 ГБ",   "Google, хорошо понимает сцены"),
+    ("llava:7b",                "4.7 ГБ", "6 ГБ",   "старая классика, слабее Qwen"),
+    ("minicpm-v:8b",            "5.5 ГБ", "7 ГБ",   "сильная на мелких деталях"),
+    ("qwen2.5vl:7b",            "6.0 ГБ", "8 ГБ",   "точнее 3b, нужна карта от 8 ГБ"),
+    ("qwen3-vl:8b",             "6.2 ГБ", "8 ГБ",   "★ лучшая для карт 8–12 ГБ"),
+    ("llama3.2-vision:11b",     "7.8 ГБ", "10 ГБ",  "Meta, неплохо, но медленнее Qwen"),
+    ("llava:13b",               "8.0 ГБ", "10 ГБ",  "старая, крупнее"),
+    ("gemma3:12b",              "8.2 ГБ", "12 ГБ",  "точная, нужна мощная карта"),
+    ("mistral-small3.2:24b",    "15 ГБ",  "18 ГБ",  "Mistral, сильная, для 24 ГБ карт"),
+    ("gemma3:27b",              "17 ГБ",  "20 ГБ",  "очень точная, для 24 ГБ карт"),
+    ("qwen3-vl:30b",            "20 ГБ",  "24 ГБ",  "MoE, быстрая для своего размера"),
+    ("qwen3-vl:32b",            "21 ГБ",  "24 ГБ",  "одна из лучших локальных"),
+    ("qwen2.5vl:32b",           "21 ГБ",  "24 ГБ",  "очень точная"),
 ]
+
+# Модели API с картинками и ПРИМЕРНЫЕ цены (USD за 1 млн токенов, вход / выход) — без наценки
+# агрегатора. Имена — как в OpenRouter; у ProxyAPI/VseGPT и др. имя может отличаться.
+# img_tok — сколько токенов примерно «стоит» одна вырезка 256–768 px у этой модели.
+# Источники: OpenRouter /api/v1/models и обзоры цен (октябрь 2026). Обновить: кнопка «Цены с OpenRouter».
+API_PRICES = [
+    # id,                                  вход,  выход, img_tok, примечание
+    ("openai/gpt-5-nano",                  0.05,  0.40,  400,  "очень дёшево, для простых случаев"),
+    ("nvidia/nemotron-3.5-super-vl:free",  0.0,   0.0,   400,  "бесплатно (лимиты), качество среднее"),
+    ("google/gemini-2.5-flash-lite",       0.10,  0.40,  260,  "★ дёшево и неплохо"),
+    ("openai/gpt-4.1-nano",                0.10,  0.40,  400,  "дёшево"),
+    ("openai/gpt-6-luna",                  0.10,  0.50,  400,  "новая дешёвая OpenAI"),
+    ("anthropic/claude-haiku-5.5",         0.10,  0.50,  400,  "новая дешёвая Claude"),
+    ("xiaomi/mimo-v2.6-flash",             0.14,  0.28,  400,  "дёшево"),
+    ("nvidia/nemotron-3.5-super-vl",       0.15,  0.50,  400,  ""),
+    ("minimax/minimax-m3.1-flash",         0.15,  0.60,  400,  ""),
+    ("deepseek/deepseek-v4.1-flash-1017",  0.15,  0.60,  400,  ""),
+    ("openai/gpt-4o-mini",                 0.15,  0.60,  8500, "картинка считается как ~8500 токенов — не так дёшево"),
+    ("openai/gpt-5-mini",                  0.25,  2.00,  400,  "★ хороший баланс"),
+    ("google/gemini-2.5-flash",            0.30,  2.50,  260,  "★ отлично видит мелкие детали"),
+    ("moondream/moondream3-preview",       0.30,  2.50,  400,  "специалист по зрению"),
+    ("openai/gpt-4.1-mini",                0.40,  1.60,  400,  ""),
+    ("anthropic/claude-haiku-4.5",         1.00,  5.00,  350,  ""),
+    ("google/gemini-2.5-pro",              1.25,  10.0,  260,  "дорого, очень точно"),
+    ("mistralai/mistral-large-4-0",        1.36,  4.18,  400,  ""),
+    ("openai/gpt-5.2",                     1.75,  14.0,  400,  ""),
+    ("openai/gpt-4.1",                     2.00,  8.00,  400,  ""),
+    ("openai/gpt-6.1-sol",                 2.00,  10.0,  400,  "флагман OpenAI"),
+    ("anthropic/claude-sonnet-5.5",        2.00,  10.0,  400,  "флагман Claude"),
+    ("x-ai/grok-4.7",                      2.00,  6.00,  400,  ""),
+    ("openai/gpt-4o",                      2.50,  10.0,  255,  ""),
+    ("anthropic/claude-sonnet-4.5",        3.00,  15.0,  350,  ""),
+    ("anthropic/claude-opus-5.5",          4.00,  20.0,  400,  "очень дорого, избыточно для знаков"),
+    ("qwen/qwen3.8-max-prime",             4.00,  12.0,  400,  ""),
+    ("typesafe/jev-router",                None,  None,  400,  "роутер: сам выбирает модель, цена плавает"),
+]
+PROMPT_TOK, ANSWER_TOK = 300, 20   # текст запроса и короткий JSON-ответ
+
+
+def cost_per_1000(price_in, price_out, img_tok=400):
+    """Примерная стоимость проверки 1000 вырезок, USD (без наценки агрегатора)."""
+    if price_in is None or price_out is None:
+        return None
+    return 1000 * ((PROMPT_TOK + img_tok) * price_in + ANSWER_TOK * price_out) / 1e6
+
+
+def openrouter_prices(proxy=None):
+    """Живой список моделей с картинками и ценами с OpenRouter (без ключа). -> [(id, in, out)] $/1M"""
+    r = _session(proxy).get("https://openrouter.ai/api/v1/models", timeout=30)
+    r.raise_for_status()
+    out = []
+    for m in r.json().get("data", []):
+        arch = m.get("architecture") or {}
+        mods = arch.get("input_modalities") or []
+        if "image" not in mods and "image" not in str(arch.get("modality", "")).split("->")[0]:
+            continue
+        pr = m.get("pricing") or {}
+        try:
+            pi, po = float(pr.get("prompt", -1)) * 1e6, float(pr.get("completion", -1)) * 1e6
+        except (TypeError, ValueError):
+            continue
+        if pi < 0 or po < 0:
+            pi = po = None
+        out.append((m.get("id"), pi, po))
+    return sorted(out, key=lambda t: (t[1] is None, t[1] or 0, t[0]))
+
 
 # Российские агрегаторы и другие OpenAI-совместимые API (оплата в рублях — у первых пяти)
 API_PROVIDERS = [
     # имя,                 base_url,                         пример модели с картинками,      сайт
-    ("ProxyAPI",           "https://api.proxyapi.ru/v1",     "openai/gpt-4o-mini",            "https://proxyapi.ru"),
+    ("ProxyAPI",           "https://api.proxyapi.ru/v1",     "openai/gpt-5-mini",             "https://proxyapi.ru"),
     ("VseGPT",             "https://api.vsegpt.ru/v1",       "openai/gpt-4o-mini",            "https://vsegpt.ru"),
     ("AITunnel",           "https://api.aitunnel.ru/v1",     "gpt-4o-mini",                   "https://aitunnel.ru"),
     ("AITunnel (зеркало)", "https://ru-api.aitunnel.ru/v1",  "gpt-4o-mini",                   "https://aitunnel.ru"),
     ("Polza.ai",           "https://polza.ai/api/v1",        "openai/gpt-4o-mini",            "https://polza.ai"),
+    ("RouterAI",           "https://routerai.ru/api/v1",     "google/gemini-2.5-flash-lite",  "https://routerai.ru"),
     ("provod.ai",          "https://api.provod.ai/v1",       "gpt-4o-mini",                   "https://provod.ai"),
-    ("OpenRouter",         "https://openrouter.ai/api/v1",   "openai/gpt-4o-mini",            "https://openrouter.ai"),
+    ("OpenRouter",         "https://openrouter.ai/api/v1",   "google/gemini-2.5-flash-lite",  "https://openrouter.ai"),
     ("OpenAI",             "https://api.openai.com/v1",      "gpt-4o-mini",                   "https://platform.openai.com"),
     ("Ollama как API",     "http://localhost:11434/v1",      "qwen3-vl:4b",                   "https://ollama.com"),
     ("Своё",               "",                               "",                              ""),
 ]
 
 # Модели с картинками, которые обычно есть у агрегаторов (точное имя смотрите кнопкой «Список моделей»)
-API_MODEL_HINTS = [
-    "openai/gpt-4o-mini", "openai/gpt-4.1-mini", "openai/gpt-4o", "anthropic/claude-sonnet-4-5",
-    "anthropic/claude-haiku-4-5", "google/gemini-2.5-flash", "google/gemini-2.5-pro",
-    "qwen/qwen2.5-vl-72b-instruct", "gpt-4o-mini", "gpt-4.1-mini",
-]
+API_MODEL_HINTS = [m[0] for m in API_PRICES]
 
 OLLAMA_URL = "http://localhost:11434"
 
@@ -75,7 +148,7 @@ def _session(proxy=None):
     return s
 
 
-def encode_crop(bgr, min_side=256, max_side=768, quality=90):
+def encode_crop(bgr, min_side=384, max_side=768, quality=92):
     """BGR-вырезка -> base64 JPEG (мелкие увеличиваем — модели плохо видят 30-пиксельные знаки)."""
     import cv2
     h, w = bgr.shape[:2]
@@ -99,12 +172,16 @@ def build_prompt(classes, context=""):
     ctx = f"Context: {context}\n" if context else ""
     return (
         "You are checking labels for an object detection dataset. The image is a crop around ONE candidate "
-        "object cut from a video frame (it may be small, blurry or partly outside the crop).\n"
+        "object cut from a video frame (it may be small, blurry, low-resolution or partly outside the crop).\n"
+        "Objects can be miniature, toy or printed models (e.g. small model road signs on a test track) — "
+        "judge by shape, colors and symbol, treat models exactly like the real thing.\n"
         f"{ctx}"
         "Which of these classes is the main object in the center of the crop?\n"
         + "\n".join(lines) +
-        "\n0. none — something else, background, a different sign, a box/sticker/poster, or unclear\n"
-        "Answer ONLY with JSON: {\"class\": <number 0-%d>, \"confidence\": <0..1>}" % len(classes)
+        "\n0. none — clearly something else: background, a box/sticker/poster, a sign NOT in the list\n"
+        "If the object matches a class description reasonably well, choose that class rather than none.\n"
+        "Answer ONLY with JSON: {\"seen\": \"<what is in the center, max 8 words>\", "
+        "\"class\": <number 0-%d>, \"name\": \"<class name or none>\", \"confidence\": <0..1>}" % len(classes)
     )
 
 
@@ -117,10 +194,17 @@ def parse_answer(text, n_cls, names=None):
     if m:
         try:
             d = json.loads(m.group(0))
+            q = max(0.0, min(1.0, float(d.get("confidence", d.get("conf", 0.8)) or 0.8)))
+            nm = str(d.get("name", "")).strip().lower()
+            if nm and names:  # имя надёжнее номера (модели путают нумерацию с 0 и с 1)
+                for i, n in enumerate(names):
+                    if nm == n.lower():
+                        return i, q
+                if nm in ("none", "nothing", "other", "unclear", "нет", "ничего"):
+                    return -1, q
             k = int(float(d.get("class", d.get("id", -1))))
-            q = float(d.get("confidence", d.get("conf", 0.8)))
             if 0 <= k <= n_cls:
-                return k - 1, max(0.0, min(1.0, q))
+                return k - 1, q
         except Exception:
             pass
     if names:  # ответили именем
@@ -159,6 +243,7 @@ class VLMJudge:
     def _ask_ollama(self, b64):
         n = len(self.classes)
         schema = {"type": "object", "properties": {"class": {"type": "integer", "minimum": 0, "maximum": n},
+                                                   "name": {"type": "string"},
                                                    "confidence": {"type": "number"}},
                   "required": ["class", "confidence"]}
         r = self.s.post(f"{self.url}/api/chat", timeout=self.timeout, json={
@@ -168,26 +253,63 @@ class VLMJudge:
         r.raise_for_status()
         return r.json().get("message", {}).get("content", "")
 
+    # Варианты параметров запроса. «Думающие» модели (gpt-5, o3, gpt-6, *-thinking…) тратят лимит токенов
+    # на рассуждения и возвращают ПУСТОЙ ответ при max_tokens=60, а temperature=0 им вообще запрещён.
+    VARIANTS = {
+        "std": lambda: {"temperature": 0, "max_tokens": 300},
+        "reasoning": lambda: {"max_completion_tokens": 4000, "reasoning_effort": "minimal"},
+        "reasoning_low": lambda: {"max_completion_tokens": 4000, "reasoning_effort": "low"},
+        "plain": lambda: {"max_tokens": 4000},
+    }
+    REASONING_RE = re.compile(r"(^|/)(o\d|gpt-5|gpt-6|.*think|.*reason|deepseek-r)", re.I)
+
+    def _variants(self):
+        if getattr(self, "variant", None):
+            return [self.variant]
+        first = ["reasoning", "reasoning_low", "plain", "std"] if self.REASONING_RE.search(self.model) else \
+            ["std", "plain", "reasoning"]
+        return first
+
+    @staticmethod
+    def _content(js):
+        """Текст ответа: строка, список частей или пусто (+ причина)."""
+        ch = (js.get("choices") or [{}])[0]
+        msg = ch.get("message") or {}
+        c = msg.get("content")
+        if isinstance(c, list):
+            c = "".join(p.get("text", "") for p in c if isinstance(p, dict))
+        return (c or "").strip(), ch.get("finish_reason")
+
     def _ask_openai(self, b64):
         if not self.url:
             raise RuntimeError("не задан адрес API (base_url)")
         h = {"Content-Type": "application/json"}
         if self.key:
             h["Authorization"] = f"Bearer {self.key}"
-        r = self.s.post(f"{self.url}/chat/completions", headers=h, timeout=self.timeout, json={
-            "model": self.model, "temperature": 0, "max_tokens": 60,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": self.prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]})
-        if r.status_code >= 400:
-            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-        return r.json()["choices"][0]["message"]["content"]
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": self.prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]
+        last = ""
+        for v in self._variants():
+            body = {"model": self.model, "messages": msgs, **self.VARIANTS[v]()}
+            r = self.s.post(f"{self.url}/chat/completions", headers=h, timeout=self.timeout, json=body)
+            if r.status_code in (401, 402, 403, 404, 429) or r.status_code >= 500:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+            if r.status_code >= 400:  # 400 — скорее всего не тот набор параметров, пробуем следующий
+                last = f"HTTP 400 ({v}): {r.text[:160]}"
+                continue
+            txt, fin = self._content(r.json())
+            if txt:
+                self.variant = v  # запоминаем рабочий вариант для этой модели
+                return txt
+            last = f"пустой ответ ({v}, finish_reason={fin})"
+        raise RuntimeError(last or "пустой ответ")
 
     def ask(self, bgr):
         """-> (класс или -1, уверенность, сырой ответ) либо (None, 0, ошибка)"""
         b64 = encode_crop(bgr)
         err = ""
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 self.calls += 1
                 txt = self._ask_ollama(b64) if self.backend == "ollama" else self._ask_openai(b64)
@@ -195,10 +317,12 @@ class VLMJudge:
                 if res is not None:
                     self.fails = 0
                     return res[0], res[1], txt
-                err = f"непонятный ответ: {str(txt)[:80]}"
+                err = f"непонятный ответ: {str(txt)[:120]}"
             except Exception as e:
-                err = f"{type(e).__name__}: {str(e)[:160]}"
-                time.sleep(1 + attempt)
+                err = f"{type(e).__name__}: {str(e)[:200]}"
+                if "HTTP 401" in err or "HTTP 402" in err or "HTTP 404" in err:
+                    break  # ключ/баланс/модель — повтор не поможет
+                time.sleep(2 * (attempt + 1))
         self.fails += 1
         self.last_error = err
         return None, 0.0, err
@@ -281,6 +405,11 @@ def _main():
         print("Локальные модели (Ollama):")
         for t, s, v, n in LOCAL_MODELS:
             print(f"  {t:<16} скачать {s:<7} видеопамять ~{v:<6} {n}")
+        print("\nМодели API (примерные цены, $ за 1 млн токенов, без наценки):")
+        for mid, pi, po, it, note in API_PRICES:
+            c = cost_per_1000(pi, po, it)
+            print(f"  {mid:<36} {'?' if pi is None else f'{pi:6.2f}'} / {'?' if po is None else f'{po:6.2f}'}"
+                  f"   ≈ {'?' if c is None else f'${c:.3f}'} за 1000 вырезок  {note}")
         print("\nAPI (OpenAI-совместимые):")
         for n, u, m, site in API_PROVIDERS:
             if u:
